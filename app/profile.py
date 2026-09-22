@@ -26,6 +26,8 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
 from cryptography.hazmat.primitives.hashes import SHA256, SHA384, SHA512
 from cryptography.x509.oid import SignatureAlgorithmOID
 
+from .derutil import parse_pss_parameters
+
 # ---------------------------------------------------------------------------
 # Resource limits (per sealed evidence set)
 # ---------------------------------------------------------------------------
@@ -72,25 +74,48 @@ OID_ECDSA_SHA256 = SignatureAlgorithmOID.ECDSA_WITH_SHA256.dotted_string
 OID_ED25519 = SignatureAlgorithmOID.ED25519.dotted_string
 
 
-def signature_algorithm_descriptor(sig_oid: str, sig_params, hash_alg) -> dict | None:
-    """Map a signature algorithm OID (+parsed params) to a profile descriptor.
+def pss_descriptor(params_tlv) -> dict | None:
+    """Build a profile descriptor from raw RSASSA-PSS AlgorithmIdentifier
+    params (DER).  Returns None when the parameters are absent, malformed or
+    outside the supported profile (unknown hash, MGF other than MGF-1, MGF-1
+    inner hash differing from the message hash, negative salt length, or
+    trailerField other than 1).
+    """
+    pss = parse_pss_parameters(params_tlv)
+    if pss is None:
+        return None
+    name = pss["hash"]
+    if name not in _PSS_BY_HASH:
+        return None
+    if pss["mgf"] != "mgf1" or pss["mgf_hash"] is None:
+        return None
+    if pss["mgf_hash"] != name:
+        return None  # profile requires MGF-1 hash == message hash
+    if not isinstance(pss["salt_length"], int) or pss["salt_length"] < 0:
+        return None
+    if pss["trailer_field"] != 1:
+        return None
+    return {
+        "algorithm": _PSS_BY_HASH[name],
+        "hash": name,
+        "mgf_hash": pss["mgf_hash"],
+        "salt_length": pss["salt_length"],
+        "trailer_field": pss["trailer_field"],
+    }
+
+
+def signature_algorithm_descriptor(sig_oid: str, sig_params) -> dict | None:
+    """Map a signature algorithm OID (+raw params) to a profile descriptor.
+
+    For RSASSA-PSS *sig_params* is the raw DER of the AlgorithmIdentifier
+    parameters; every operative parameter (message hash, MGF-1 inner hash,
+    salt length, trailer field) is taken from that exact encoding so a
+    tampered declaration can never be verified against different parameters.
 
     Returns None when the algorithm is out of profile.
     """
     if sig_oid == OID_RSASSA_PSS:
-        if hash_alg is None:
-            return None
-        name = hash_alg.name
-        if name not in _PSS_BY_HASH:
-            return None
-        desc = {"algorithm": _PSS_BY_HASH[name], "hash": name}
-        if sig_params is not None and isinstance(sig_params, padding.PSS):
-            mgf_hash = getattr(sig_params._mgf, "_algorithm", None)
-            desc["mgf_hash"] = getattr(mgf_hash, "name", None)
-            desc["salt_length"] = sig_params._salt_length
-            if desc["mgf_hash"] != name:
-                return None  # profile requires MGF-1 hash == signature hash
-        return desc
+        return pss_descriptor(sig_params)
     if sig_oid == OID_ECDSA_SHA256:
         return {"algorithm": ALG_ECDSA_P256_SHA256, "hash": "sha256"}
     if sig_oid == OID_ED25519:
@@ -115,15 +140,23 @@ def public_key_descriptor(pub) -> dict | None:
 
 
 def verify_signature(pub, descriptor: dict, signature: bytes, data: bytes) -> bool:
-    """Verify *signature* over *data*; returns True/False (never raises)."""
+    """Verify *signature* over *data*; returns True/False (never raises).
+
+    For RSASSA-PSS the message digest and the MGF-1 inner digest are both
+    taken from the descriptor parsed from the object's own AlgorithmIdentifier
+    (the profile requires them to be equal).  The salt length is recovered
+    from the signature (PSS.AUTO), per the supported profile.
+    """
     try:
         alg = descriptor["algorithm"]
         if alg.startswith("rsa-pss-"):
             hash_alg = _HASH_BY_NAME[descriptor["hash"]]()
+            mgf_name = descriptor.get("mgf_hash", descriptor["hash"])
+            mgf_hash = _HASH_BY_NAME[mgf_name]()
             pub.verify(
                 signature,
                 data,
-                padding.PSS(mgf=padding.MGF1(hash_alg), salt_length=padding.PSS.AUTO),
+                padding.PSS(mgf=padding.MGF1(mgf_hash), salt_length=padding.PSS.AUTO),
                 hash_alg,
             )
             return True

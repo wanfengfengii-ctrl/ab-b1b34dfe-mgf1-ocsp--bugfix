@@ -419,6 +419,25 @@ def main():
                           cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     check("rejection pack verification", proc.returncode == 0)
 
+    # -- code-level RSASSA-PSS parameter regression (same image/code that
+    #    runs in api-a: `docker compose exec -T api-a python -m
+    #    acceptance.pss_regression`).  An OCSP response declaring MGF1-SHA384
+    #    while signed with MGF1-SHA256 must be UNSUPPORTED, never authorized.
+    proc = subprocess.run(
+        [sys.executable, "-m", "acceptance.pss_regression"],
+        capture_output=True, text=True,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
+    print(proc.stdout, flush=True)
+    if proc.stderr.strip():
+        print(proc.stderr, file=sys.stderr, flush=True)
+    check("pss parameter regression exit code", proc.returncode == 0,
+          proc.stdout[-500:] + proc.stderr[-500:])
+    check("pss mgf mismatch no longer accepted",
+          "BUG_MGF_MISMATCH_ACCEPTED=False" in proc.stdout
+          and "BUG_MGF_MISMATCH_ACCEPTED=True" not in proc.stdout,
+          proc.stdout[-500:])
+
     if _failures:
         print(f"\nACCEPTANCE FAILED ({len(_failures)} checks): {_failures}", flush=True)
         return 1

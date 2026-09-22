@@ -246,6 +246,129 @@ _HASH_OIDS = {
     "1.3.14.3.2.26": "sha1",
 }
 
+# id-mgf1 (RFC 4055)
+OID_MGF1 = "1.2.840.113549.1.1.8"
+
+
+def _decode_integer_tlv(tlv: bytes) -> int:
+    tag, start, end = read_tlv(tlv, 0)
+    if tag != 0x02 or start == end:
+        raise ValueError("expected an INTEGER")
+    return int.from_bytes(tlv[start:end], "big", signed=True)
+
+
+def _decode_algorithm_identifier(ai_tlv: bytes):
+    """Decode an AlgorithmIdentifier SEQUENCE TLV into (oid, params_tlv|None).
+
+    The raw parameters TLV is returned untouched (NULL included); callers
+    decide which parameter forms are in profile.
+    """
+    tag, start, end = read_tlv(ai_tlv, 0)
+    if tag != 0x30:
+        raise ValueError("AlgorithmIdentifier must be a SEQUENCE")
+    oid, n = der_to_oid(ai_tlv[start:])
+    pos = start + n
+    params = None
+    if pos < end:
+        _, ps, pe = read_tlv(ai_tlv, pos)
+        if pe != end:
+            raise ValueError("trailing bytes after AlgorithmIdentifier parameters")
+        params = ai_tlv[pos:pe]
+    return oid, params
+
+
+def _decode_explicit_wrapper(params_tlv: bytes, cs: int, ce: int) -> bytes:
+    """Return the single TLV wrapped by an EXPLICIT tagged element."""
+    _, s, e = read_tlv(params_tlv, cs)
+    if e != ce:
+        raise ValueError("explicit wrapper must contain exactly one element")
+    return params_tlv[cs:ce]
+
+
+def _is_null_params(params_tlv: bytes | None) -> bool:
+    if params_tlv is None:
+        return True
+    tag, start, end = read_tlv(params_tlv, 0)
+    return tag == 0x05 and start == end
+
+
+def parse_pss_parameters(params_tlv: bytes | None) -> dict | None:
+    """Parse RSASSA-PSS params (RFC 4055) straight from the DER.
+
+    Returns ``{"hash", "mgf", "mgf_hash", "salt_length", "trailer_field"}``
+    or ``None`` only when the encoding is absent or structurally malformed
+    (unknown PSS field, wrong tags, truncated DER).  Absent optional fields
+    carry their RFC 4055 defaults (saltLength 20, trailerField 1); an absent
+    hashAlgorithm or maskGenAlgorithm means SHA-1 and is reported as such (or
+    ``None`` when the OID is unrecognized).  This routine is deliberately a
+    pure structural parser; the supported *profile* is enforced by
+    :func:`app.profile.pss_descriptor`.
+    """
+    try:
+        if not params_tlv:
+            return None
+        tag, start, end = read_tlv(params_tlv, 0)
+        if tag != 0x30:
+            return None
+        hash_name = None
+        mgf_oid = None
+        mgf_hash = None
+        salt_length = 20          # RFC 4055 default
+        trailer_field = 1        # RFC 4055 default
+        pos = start
+        while pos < end:
+            tag, cs, ce = read_tlv(params_tlv, pos)
+            if tag == 0xA0:  # hashAlgorithm [0] EXPLICIT AlgorithmIdentifier
+                ai_tlv = _decode_explicit_wrapper(params_tlv, cs, ce)
+                oid, params = _decode_algorithm_identifier(ai_tlv)
+                if not _is_null_params(params):
+                    return None
+                hash_name = _HASH_OIDS.get(oid)
+            elif tag == 0xA1:  # maskGenAlgorithm [1] EXPLICIT AlgorithmIdentifier
+                ai_tlv = _decode_explicit_wrapper(params_tlv, cs, ce)
+                mgf_oid, mgf_params = _decode_algorithm_identifier(ai_tlv)
+                if mgf_oid == OID_MGF1 and mgf_params:
+                    inner_oid, inner_params = _decode_algorithm_identifier(mgf_params)
+                    if not _is_null_params(inner_params):
+                        return None
+                    mgf_hash = _HASH_OIDS.get(inner_oid)
+            elif tag == 0xA2:  # saltLength [2] EXPLICIT INTEGER
+                salt_length = _decode_integer_tlv(
+                    _decode_explicit_wrapper(params_tlv, cs, ce))
+            elif tag == 0xA3:  # trailerField [3] EXPLICIT INTEGER
+                trailer_field = _decode_integer_tlv(
+                    _decode_explicit_wrapper(params_tlv, cs, ce))
+            else:
+                return None  # unknown RSASSA-PSS field
+            pos = ce
+        return {
+            "hash": hash_name,
+            "mgf": "mgf1" if mgf_oid == OID_MGF1 else mgf_oid,
+            "mgf_hash": mgf_hash,
+            "salt_length": salt_length,
+            "trailer_field": trailer_field,
+        }
+    except (ValueError, IndexError):
+        return None
+
+
+def extract_outer_signature_algorithm(der: bytes):
+    """Pull the signatureAlgorithm (oid, raw params TLV) that follows the
+    tbsCertificate/tbsCertList in a Certificate or CertificateList.
+
+    The outer AlgorithmIdentifier is the operative one for verification;
+    cryptography does not expose every RSASSA-PSS parameter (e.g. it accepts
+    trailerField values silently), so callers parse the raw DER themselves.
+    """
+    _, s, _ = read_tlv(der, 0)
+    tag, _, te = read_tlv(der, s)              # tbs SEQUENCE
+    if tag != 0x30:
+        raise ValueError("expected a tbs SEQUENCE")
+    tag, as_, ae = read_tlv(der, te)           # signatureAlgorithm
+    if tag != 0x30:
+        raise ValueError("expected signatureAlgorithm")
+    return _decode_algorithm_identifier(der[te:ae])
+
 
 def extract_ocsp_signature_algorithm(der: bytes):
     """Pull the signatureAlgorithm OID and raw params out of a DER OCSP
@@ -264,27 +387,4 @@ def extract_ocsp_signature_algorithm(der: bytes):
     tag, as_, ae = read_tlv(basic, e4)      # signatureAlgorithm
     if tag != 0x30:
         raise ValueError("missing signatureAlgorithm")
-    alg_tlv = basic[e4:ae]
-    _, cs, _ = read_tlv(alg_tlv, 0)
-    oid, pos = der_to_oid(alg_tlv[cs:])
-    params = alg_tlv[cs + pos :] if cs + pos < len(alg_tlv) else None
-    return oid, params
-
-
-def pss_params_hash_name(params_tlv: bytes | None):
-    """Extract the hash algorithm name from RSASSA-PSS params (None for the
-    PSS defaults, which are SHA-1 and therefore out of profile)."""
-    if not params_tlv:
-        return None
-    tag, start, end = read_tlv(params_tlv, 0)
-    if tag != 0x30:
-        return None
-    pos = start
-    while pos < end:
-        tag, cs, ce = read_tlv(params_tlv, pos)
-        if tag == 0xA0:  # hashAlgorithm [0]
-            _, is_, _ = read_tlv(params_tlv, cs)
-            oid, _ = der_to_oid(params_tlv[is_:ce])
-            return _HASH_OIDS.get(oid)
-        pos = ce
-    return None  # default hashAlgorithm is sha1
+    return _decode_algorithm_identifier(basic[e4:ae])

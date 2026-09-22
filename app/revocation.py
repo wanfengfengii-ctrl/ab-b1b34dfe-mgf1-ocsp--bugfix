@@ -139,16 +139,18 @@ def parse_crl(der: bytes, fingerprint: str | None = None) -> CrlInfo:
     fp = fingerprint or sha256_hex(der)
     unsupported: list = []
 
-    sig_oid = crl.signature_algorithm_oid.dotted_string
+    # --- signature algorithm ---------------------------------------------
+    # Parse the operative (outer) AlgorithmIdentifier straight from the DER
+    # so every RSASSA-PSS parameter it declares (message hash, MGF-1 inner
+    # hash, salt length, trailer field) is honored at verification time.
+    from .derutil import extract_outer_signature_algorithm
+
     try:
-        hash_alg = crl.signature_hash_algorithm
-    except Exception:
-        hash_alg = None
-    try:
-        sig_params = crl.signature_algorithm_parameters
-    except Exception:
+        sig_oid, sig_params = extract_outer_signature_algorithm(der)
+    except ValueError:
+        sig_oid = crl.signature_algorithm_oid.dotted_string
         sig_params = None
-    sig_alg = profile.signature_algorithm_descriptor(sig_oid, sig_params, hash_alg)
+    sig_alg = profile.signature_algorithm_descriptor(sig_oid, sig_params)
     if sig_alg is None:
         unsupported.append(
             _unsupported("UNSUPPORTED_SIGNATURE_ALGORITHM", f"signature algorithm OID {sig_oid}")
@@ -286,27 +288,19 @@ def parse_ocsp(der: bytes, fingerprint: str | None = None) -> OcspInfo:
         )
     unsupported: list = []
 
-    sig_oid = resp.signature_algorithm_oid.dotted_string
-    if sig_oid == profile.OID_RSASSA_PSS:
-        # cryptography does not expose PSS parameters for OCSP responses
-        from .derutil import extract_ocsp_signature_algorithm, pss_params_hash_name
+    # --- signature algorithm ---------------------------------------------
+    # cryptography does not expose the RSASSA-PSS parameters of an OCSP
+    # response; take the AlgorithmIdentifier OID + raw params straight from
+    # the DER so the declared message hash, MGF-1 inner hash, salt length and
+    # trailer field are exactly what verification uses.
+    from .derutil import extract_ocsp_signature_algorithm
 
-        try:
-            _oid, params = extract_ocsp_signature_algorithm(der)
-            hash_name = pss_params_hash_name(params)
-        except ValueError:
-            hash_name = None
-        sig_alg = (
-            {"algorithm": f"rsa-pss-{hash_name}", "hash": hash_name}
-            if hash_name in ("sha256", "sha384", "sha512")
-            else None
-        )
-    else:
-        try:
-            hash_alg = resp.signature_hash_algorithm
-        except Exception:
-            hash_alg = None
-        sig_alg = profile.signature_algorithm_descriptor(sig_oid, None, hash_alg)
+    try:
+        sig_oid, sig_params = extract_ocsp_signature_algorithm(der)
+    except ValueError:
+        sig_oid = resp.signature_algorithm_oid.dotted_string
+        sig_params = None
+    sig_alg = profile.signature_algorithm_descriptor(sig_oid, sig_params)
     if sig_alg is None:
         unsupported.append(
             _unsupported("UNSUPPORTED_SIGNATURE_ALGORITHM", f"signature algorithm OID {sig_oid}")
@@ -533,11 +527,14 @@ class RevocationEvaluator:
         evaluated: dict = {}
         views: list = []
         defective = 0
+        unsupported = False  # at least one evaluated object was out of profile
 
         def exclude(fp, otype, reason, detail=None, is_defective=False):
-            nonlocal defective
+            nonlocal defective, unsupported
             if is_defective:
                 defective += 1
+            if reason == "UNSUPPORTED":
+                unsupported = True
             rec = self._record(fp, otype, "excluded", reason, detail)
             evaluated.setdefault(fp, rec)
 
@@ -673,7 +670,17 @@ class RevocationEvaluator:
             "knowledge_cutoff": canon_time(cutoff),
         }
         if not views:
-            outcome["status"] = "MALFORMED_EVIDENCE" if defective else "UNKNOWN"
+            if unsupported:
+                # At least one evaluated object was parseable but carried an
+                # out-of-profile encoding (e.g. an RSASSA-PSS AlgorithmIdentifier
+                # whose MGF-1 hash does not match the message hash).  Such
+                # evidence must classify as UNSUPPORTED, never as an ordinary
+                # bad signature and never as an authorization failure.
+                outcome["status"] = "UNSUPPORTED"
+            elif defective:
+                outcome["status"] = "MALFORMED_EVIDENCE"
+            else:
+                outcome["status"] = "UNKNOWN"
             outcome["selected_view"] = None
             outcome["selected_evidence"] = []
             outcome["evaluated_evidence"] = [evaluated[k] for k in sorted(evaluated)]

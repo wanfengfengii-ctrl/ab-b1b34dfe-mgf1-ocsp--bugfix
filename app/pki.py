@@ -121,16 +121,18 @@ def parse_certificate(der: bytes, fingerprint: str | None = None) -> CertInfo:
     unsupported: list = []
 
     # --- signature algorithm ---------------------------------------------
-    sig_oid = cert.signature_algorithm_oid.dotted_string
+    # The operative parameters are the ones carried in the outer
+    # signatureAlgorithm (which is what a verifier uses); parse them straight
+    # from the DER so a tampered AlgorithmIdentifier can never be verified
+    # under different parameters (e.g. MGF-1 hash mismatch).
+    from .derutil import extract_outer_signature_algorithm
+
     try:
-        hash_alg = cert.signature_hash_algorithm
-    except Exception:
-        hash_alg = None
-    try:
-        sig_params = cert.signature_algorithm_parameters
-    except Exception:
+        sig_oid, sig_params = extract_outer_signature_algorithm(der)
+    except ValueError:
+        sig_oid = cert.signature_algorithm_oid.dotted_string
         sig_params = None
-    sig_alg = profile.signature_algorithm_descriptor(sig_oid, sig_params, hash_alg)
+    sig_alg = profile.signature_algorithm_descriptor(sig_oid, sig_params)
     if sig_alg is None:
         unsupported.append(
             _unsupported("UNSUPPORTED_SIGNATURE_ALGORITHM", f"signature algorithm OID {sig_oid}")

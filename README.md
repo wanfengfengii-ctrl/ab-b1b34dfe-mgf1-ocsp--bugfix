@@ -360,7 +360,33 @@ docker compose exec api-a python -m app.verify /tmp/pack.json
 pip install -r requirements.txt
 DATA_DIR=/tmp/pki python -m app.api          # serves on :8080
 python -m pytest tests/ -q                   # unit + API tests
+
+# code-level RSASSA-PSS parameter regression (also runs as the final phase of
+# the `verify` acceptance service).  Inside a running stack:
+docker compose exec -T api-a python -m acceptance.pss_regression
+# ...or locally:
+python -m acceptance.pss_regression
 ```
+
+### RSASSA-PSS parameters are taken from the signed object itself
+
+For certificates, CRLs and OCSP responses alike, every RSASSA-PSS verification
+parameter — the message hash, the MGF-1 inner hash, the declared salt length
+and `trailerField` — is parsed directly from the object's operative
+`AlgorithmIdentifier` DER and used verbatim at verification time.  Nothing is
+ignored, re-defaulted or taken from a different field:
+
+* MGF-1 with a different hash than the message hash is **out of profile**
+  (`UNSUPPORTED`), even though the object parses.  An OCSP response that
+  declares MGF1-SHA-384 while its signature was produced with MGF1-SHA-256 is
+  therefore never authorized; the response is excluded with reason
+  `UNSUPPORTED` and the per-certificate conclusion is `UNSUPPORTED`.
+* Corrupting the signature bytes of an object whose parameters *do* conform to
+  the profile stays in the ordinary signature-invalid bucket
+  (`SIGNATURE_INVALID` / `RESPONDER_UNAUTHORIZED`, per-certificate
+  `MALFORMED_EVIDENCE`), never `UNSUPPORTED`.
+* The salt length is recorded from the declaration and recovered at
+  verification (`PSS.AUTO`); `trailerField` other than `1` is out of profile.
 
 Layout: `app/` (service: `canonical`, `profile`, `pki`, `derutil`,
 `revocation`, `graph`, `adjudicate`, `objmeta`, `store`, `api`, `verify`),

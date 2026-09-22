@@ -351,7 +351,11 @@ def _issuer_hashes(issuer: Entity, hash_alg) -> tuple:
     return h1.finalize(), h2.finalize()
 
 
-# --- minimal DER rewriting to turn an RSA PKCS#1 OCSP response into PSS -----
+# --- DER surgery for RSASSA-PSS objects (certificates, CRLs, OCSP) ---------
+#
+# cryptography's builders can only emit PKCS#1 v1.5 OCSP responses and do not
+# expose every RSASSA-PSS parameter, so the fixtures construct and mutate the
+# AlgorithmIdentifier DER directly.  These helpers are test tooling only.
 
 def _der_read(data: bytes, pos: int):
     tag = data[pos]
@@ -375,18 +379,79 @@ def _der_encode(tag: int, content: bytes) -> bytes:
     return bytes([tag]) + hdr + content
 
 
+_OID_RSASSA_PSS = bytes.fromhex("2a864886f70d01010a")
+_OID_MGF1 = bytes.fromhex("2a864886f70d010108")
+_OID_BY_HASH = {
+    "sha256": bytes.fromhex("608648016503040201"),
+    "sha384": bytes.fromhex("608648016503040202"),
+    "sha512": bytes.fromhex("608648016503040203"),
+}
+
+
+def _oid_tlv(oid_der: bytes) -> bytes:
+    return _der_encode(0x06, oid_der)
+
+
+def _hash_ai(hash_name: str) -> bytes:
+    # AlgorithmIdentifier { hash OID, NULL }
+    return _der_encode(0x30, _oid_tlv(_OID_BY_HASH[hash_name]) + _der_encode(0x05, b""))
+
+
+def pss_algorithm_identifier(*, hash_name: str = "sha256",
+                             mgf_hash: str | None = None,
+                             salt_length: int = 32,
+                             trailer_field: int = 1) -> bytes:
+    """Build a full RSASSA-PSS AlgorithmIdentifier TLV (RFC 4055).
+
+    hashAlgorithm [0], maskGenAlgorithm [1] (MGF-1), saltLength [2] and
+    trailerField [3] are all emitted explicitly.
+    """
+    mgf_hash = mgf_hash or hash_name
+    if hash_name not in _OID_BY_HASH or mgf_hash not in _OID_BY_HASH:
+        raise ValueError("unsupported PSS hash")
+    if salt_length < 0 or trailer_field < 0 or salt_length > 255 or trailer_field > 255:
+        raise ValueError("PSS integer fields out of fixture builder range")
+    hash_ai = _hash_ai(hash_name)
+    mgf_ai = _der_encode(0x30, _oid_tlv(_OID_MGF1) + _hash_ai(mgf_hash))
+    salt = _der_encode(0x02, bytes([salt_length]))
+    params_content = (
+        _der_encode(0xA0, hash_ai)
+        + _der_encode(0xA1, mgf_ai)
+        + _der_encode(0xA2, salt)
+    )
+    if trailer_field != 1:
+        params_content += _der_encode(
+            0xA3, _der_encode(0x02, bytes([trailer_field])))
+    params = _der_encode(0x30, params_content)
+    return _der_encode(0x30, _oid_tlv(_OID_RSASSA_PSS) + params)
+
+
 # RSASSA-PSS AlgorithmIdentifier: sha256, MGF-1-sha256, salt length 32
-_PSS_ALG = bytes.fromhex(
-    "304106092a864886f70d01010a3034a00f300d06096086480165030402010500"
-    "a11c301a06092a864886f70d010108300d06096086480165030402010500"
-    "a203020120"
-)
+_PSS_ALG = pss_algorithm_identifier()
 
 
-def _pss_ocsp_surgery(der: bytes, key) -> bytes:
+def _pss_ocsp_surgery(der: bytes, key, alg_der: bytes = _PSS_ALG,
+                      salt_length: int = 32) -> bytes:
     """Replace the signatureAlgorithm/signature of a BasicOCSPResponse with
-    RSASSA-PSS(SHA-256, MGF-1-SHA-256, saltlen=32).  Test tooling only."""
-    # OCSPResponse ::= SEQUENCE { status ENUMERATED, responseBytes [0] EXPLICIT }
+    RSASSA-PSS.  Test tooling only."""
+    tbs, _alg, sig_tlv, certs_tail, envelope = _split_ocsp_basic(der)
+    signature = _sign_pss(key, tbs, salt_length)
+    return _assemble_ocsp(envelope, tbs, alg_der,
+                          _der_encode(0x03, b"\x00" + signature), certs_tail)
+
+
+def _sign_pss(key, tbs: bytes, salt_length: int) -> bytes:
+    return key.sign(tbs,
+                    padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
+                                salt_length=salt_length),
+                    hashes.SHA256())
+
+
+def _split_ocsp_basic(der: bytes):
+    """Decompose a successful DER OCSP response into the pieces a test needs
+    to tamper with: tbsResponseData, signatureAlgorithm TLV, signature BIT
+    STRING TLV, the optional certs tail, and the fixed envelope prefix.
+    """
     _, _, p = _der_read(der, 0)
     assert der[p] == 0x0A and der[p + 2] == 0x00, "expected successful status"
     status_part = der[p : p + 3]
@@ -401,17 +466,99 @@ def _pss_ocsp_surgery(der: bytes, key) -> bytes:
     _, tbs_len, bp2 = _der_read(basic, bp)
     tbs = basic[bp : bp2 + tbs_len]
     pos = bp2 + tbs_len
-    _, sa_len, sp = _der_read(basic, pos)     # old signatureAlgorithm
-    pos = sp + sa_len
-    _, sig_len, sp2 = _der_read(basic, pos)   # old signature BIT STRING
-    pos = sp2 + sig_len
-    certs_part = basic[pos:]                  # optional [0] certificates
-    signature = sign_data(key, tbs)
-    new_basic = _der_encode(
-        0x30, tbs + _PSS_ALG + _der_encode(0x03, b"\x00" + signature) + certs_part
-    )
+    alg_s, alg_len, ap = _der_read(basic, pos)
+    alg_tlv = basic[pos : ap + alg_len]
+    pos = ap + alg_len
+    sig_s, sig_len, sp = _der_read(basic, pos)
+    sig_tlv = basic[pos : sp + sig_len]
+    certs_tail = basic[sp + sig_len :]
+    envelope = (status_part, oid_part)
+    return tbs, alg_tlv, sig_tlv, certs_tail, envelope
+
+
+def _assemble_ocsp(envelope, tbs: bytes, alg_tlv: bytes, sig_tlv: bytes,
+                   certs_tail: bytes) -> bytes:
+    status_part, oid_part = envelope
+    new_basic = _der_encode(0x30, tbs + alg_tlv + sig_tlv + certs_tail)
     response_bytes = _der_encode(0x30, oid_part + _der_encode(0x04, new_basic))
     return _der_encode(0x30, status_part + _der_encode(0xA0, response_bytes))
+
+
+def ocsp_replace_signature_algorithm(der: bytes, alg_tlv: bytes) -> bytes:
+    """Replace ONLY the BasicOCSPResponse.signatureAlgorithm; tbsResponseData
+    and the signature BIT STRING are preserved byte-for-byte."""
+    tbs, _old_alg, sig_tlv, certs_tail, envelope = _split_ocsp_basic(der)
+    return _assemble_ocsp(envelope, tbs, alg_tlv, sig_tlv, certs_tail)
+
+
+def ocsp_corrupt_signature(der: bytes) -> bytes:
+    """Flip a byte inside the OCSP signature BIT STRING; the tbs and the
+    (profile-conforming) signatureAlgorithm are preserved."""
+    tbs, alg_tlv, sig_tlv, certs_tail, envelope = _split_ocsp_basic(der)
+    body = bytearray(sig_tlv)
+    body[-1] ^= 0x01  # last byte is inside the signature octets (after 0x00 pad)
+    return _assemble_ocsp(envelope, tbs, alg_tlv, bytes(body), certs_tail)
+
+
+def _locate_tbs_signature_algorithm(tbs_full: bytes, *, crl: bool):
+    """Return (alg_tlv_start, alg_tlv_end) offsets within *tbs_full* (which
+    begins at the tbs SEQUENCE tag) of the signatureAlgorithm inside the tbs.
+    """
+    from app.derutil import read_tlv
+
+    _, pos, content_end = read_tlv(tbs_full, 0)
+    if crl:
+        if tbs_full[pos] == 0x02:  # optional version INTEGER
+            _, _, ve = read_tlv(tbs_full, pos)
+            pos = ve
+    else:
+        # [0] EXPLICIT version, serial INTEGER, then signatureAlgorithm
+        _, _, ve = read_tlv(tbs_full, pos)
+        _, _, se = read_tlv(tbs_full, ve)
+        pos = se
+    tag, as_, ae = read_tlv(tbs_full, pos)
+    assert tag == 0x30, "expected signatureAlgorithm SEQUENCE inside tbs"
+    assert ae <= content_end
+    return pos, ae
+
+
+def signed_object_replace_signature_algorithm(der: bytes, alg_tlv: bytes,
+                                              *, crl: bool = False) -> bytes:
+    """Replace the signatureAlgorithm both inside the tbs (certificate's
+    tbsCertificate.signature / CRL's tbsCertList.signature) and in the outer
+    position.  The signature bytes are preserved, so no re-signing happens:
+    the object parses but its signature cannot verify.
+    """
+    from app.derutil import encode_tlv, read_tlv
+
+    _, s, e = read_tlv(der, 0)
+    _, ts, te = read_tlv(der, s)             # tbs SEQUENCE
+    tbs_full = der[s:te]
+    inner_lo, inner_hi = _locate_tbs_signature_algorithm(tbs_full, crl=crl)
+    _, cs, _ = read_tlv(tbs_full, 0)
+    # inner_lo/inner_hi are absolute indices in tbs_full; rebuild tbs content
+    new_tbs_content = tbs_full[cs:inner_lo] + alg_tlv + tbs_full[inner_hi:]
+    new_tbs = encode_tlv(0x30, new_tbs_content)
+    _, oas, oae = read_tlv(der, te)          # outer signatureAlgorithm
+    sig_tlv = der[oae:e]
+    # the object is a single top-level SEQUENCE; re-encode it wholesale
+    return encode_tlv(0x30, new_tbs + alg_tlv + sig_tlv)
+
+
+def cert_replace_signature_algorithm(der: bytes, alg_tlv: bytes) -> bytes:
+    return signed_object_replace_signature_algorithm(der, alg_tlv, crl=False)
+
+
+def crl_replace_signature_algorithm(der: bytes, alg_tlv: bytes) -> bytes:
+    return signed_object_replace_signature_algorithm(der, alg_tlv, crl=True)
+
+
+def corrupt_object_signature(der: bytes) -> bytes:
+    """Flip the last byte of the trailing signature BIT STRING of a
+    Certificate/CertificateList; tbs and algorithms are preserved."""
+    body = bytearray(der)
+    body[-1] ^= 0x01
+    return bytes(body)
 
 
 @dataclass
