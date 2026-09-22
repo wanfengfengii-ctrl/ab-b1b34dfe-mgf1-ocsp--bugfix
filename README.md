@@ -360,7 +360,27 @@ docker compose exec api-a python -m app.verify /tmp/pack.json
 pip install -r requirements.txt
 DATA_DIR=/tmp/pki python -m app.api          # serves on :8080
 python -m pytest tests/ -q                   # unit + API tests
+
+# RSASSA-PSS parameter regression (same module as inside the api-a image):
+docker compose exec -T api-a python -m acceptance.regression_pss
+python -m acceptance.regression_pss
 ```
+
+`acceptance.regression_pss` is the code-level check for RSASSA-PSS
+parameter consistency.  It confirms that a legitimate RSA-PSS OCSP response
+(serial `4242`, `thisUpdate` 2024-05-20, `nextUpdate` 2024-06-20, SHA-256
+message hash and MGF-1) is authorized; that retargeting only the
+signature-uncovered `AlgorithmIdentifier` from MGF1-SHA-256 to MGF1-SHA-384
+(keeping the signature value and `tbsResponseData` byte-identical) is
+rejected as structured `UNSUPPORTED` and never authorized; and that a
+profile-conformant declaration with broken signature bytes keeps the
+ordinary signature-invalid classification.  It also re-checks certificates,
+CRLs and the offline evidence-pack review (`app.verify`): message hash,
+MGF-1 inner hash, salt length and `trailerField` carry identical semantics at
+every entry point.  The same module runs as the one-shot `pss-regression`
+compose service (a required predecessor of `verify`) and as
+`tests/test_pss_mgf_regression.py`.  It exits non-zero on any failed
+assertion and never prints `BUG_MGF_MISMATCH_ACCEPTED=True`.
 
 Layout: `app/` (service: `canonical`, `profile`, `pki`, `derutil`,
 `revocation`, `graph`, `adjudicate`, `objmeta`, `store`, `api`, `verify`),

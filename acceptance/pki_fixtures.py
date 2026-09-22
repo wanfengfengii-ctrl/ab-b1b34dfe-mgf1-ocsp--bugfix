@@ -382,6 +382,146 @@ _PSS_ALG = bytes.fromhex(
     "a203020120"
 )
 
+# hash OIDs used to build RSASSA-PSS AlgorithmIdentifier variants (tests only)
+_PSS_HASH_OIDS = {
+    "sha1": "1.3.14.3.2.26",
+    "sha256": "2.16.840.1.101.3.4.2.1",
+    "sha384": "2.16.840.1.101.3.4.2.2",
+    "sha512": "2.16.840.1.101.3.4.2.3",
+}
+_OID_MGF1 = "1.2.840.113549.1.1.8"
+_OID_RSASSA_PSS = "1.2.840.113549.1.1.10"
+
+
+def build_pss_algorithm_der(*, hash_name="sha256", mgf_hash_name=None,
+                            salt_length=32, trailer_field=1) -> bytes:
+    """Build an RSASSA-PSS signatureAlgorithm TLV (test tooling only).
+
+    The result is the full AlgorithmIdentifier (id-RSASSA-PSS OID plus the
+    explicit RSASSA-PSS-params).  All params are encoded explicitly
+    (including trailerField) so the bytes declare exactly the requested
+    message hash, MGF-1 inner hash, salt length and trailer field.
+    """
+    from app.derutil import oid_to_der
+
+    mgf_hash_name = mgf_hash_name or hash_name
+
+    def _alg_id(oid: str) -> bytes:
+        return _der_encode(0x30, oid_to_der(oid) + _der_encode(0x05, b""))
+
+    if salt_length < 0 or salt_length > 0xFFFFFFFF:
+        raise ValueError("bad salt length")
+    salt_int = salt_length.to_bytes(
+        max(1, (salt_length.bit_length() + 7) // 8), "big")
+    if salt_int[0] & 0x80:          # keep the INTEGER positive in DER
+        salt_int = b"\x00" + salt_int
+    params = _der_encode(0x30, b"".join([
+        _der_encode(0xA0, _alg_id(_PSS_HASH_OIDS[hash_name])),
+        _der_encode(0xA1, _der_encode(0x30, oid_to_der(_OID_MGF1)
+                                      + _alg_id(_PSS_HASH_OIDS[mgf_hash_name]))),
+        _der_encode(0xA2, _der_encode(0x02, salt_int)),
+        _der_encode(0xA3, _der_encode(0x02, bytes([trailer_field & 0xFF]))),
+    ]))
+    return _der_encode(0x30, oid_to_der(_OID_RSASSA_PSS) + params)
+
+
+def rewrite_cert_or_crl_sig_algorithm(der: bytes, new_alg: bytes) -> bytes:
+    """Replace BOTH signatureAlgorithm copies of a DER Certificate or
+    CertificateList (the one inside the tbs and the outer one), keeping all
+    tbs data and the signature BIT STRING unchanged.
+
+    RFC 5280 requires the two AlgorithmIdentifiers to be identical, so a
+    conformant tamper that only changes parameters must change both.  Test
+    tooling only.
+    """
+
+    def _fr(buf: bytes, pos: int):
+        """Read a TLV; return (tag, content_start, content_end)."""
+        tag, length, cstart = _der_read(buf, pos)
+        return tag, cstart, cstart + length
+
+    _, outer_cs, outer_ce = _fr(der, 0)
+    _, tbs_cs, tbs_ce = _fr(der, outer_cs)        # tbsCertificate/tbsCertList
+    tbs_tlv = der[outer_cs:tbs_ce]
+    # locate the AlgorithmIdentifier inside the tbs:
+    #   Certificate: [0] version?, serial INTEGER, signature AlgId, ...
+    #   CertList:    version INTEGER?, signature AlgId, issuer, ...
+    _, inner_cs, inner_ce = _fr(tbs_tlv, 0)
+    pos = inner_cs
+    if tbs_tlv[pos] == 0xA0:                      # certificate [0] version
+        _, _, pos = _fr(tbs_tlv, pos)
+    if tbs_tlv[pos] == 0x02:                      # serial (cert) / version (CRL)
+        _, _, pos = _fr(tbs_tlv, pos)
+    if tbs_tlv[pos] != 0x30:
+        raise ValueError("could not locate inner signatureAlgorithm in tbs")
+    _, alg_cs, alg_ce = _fr(tbs_tlv, pos)
+    new_tbs = _der_encode(
+        0x30,
+        tbs_tlv[inner_cs:pos] + new_alg + tbs_tlv[alg_ce:inner_ce],
+    )
+    # outer: tbs, outer signatureAlgorithm, signature BIT STRING
+    _, outer_alg_cs, outer_alg_ce = _fr(der, tbs_ce)
+    content = new_tbs + new_alg + der[outer_alg_ce:outer_ce]
+    return _der_encode(0x30, content)
+
+
+def corrupt_cert_or_crl_signature(der: bytes) -> bytes:
+    """Flip the last byte of the outer signature BIT STRING of a DER
+    Certificate/CertificateList, leaving the AlgorithmIdentifier untouched."""
+    _, _, outer_cs = _der_read(der, 0)                  # outer SEQUENCE
+    _, tbs_len, tbs_cs = _der_read(der, outer_cs)      # tbs SEQUENCE
+    _, alg_len, alg_cs = _der_read(der, tbs_cs + tbs_len)
+    _, sig_len, sig_cs = _der_read(der, alg_cs + alg_len)
+    out = bytearray(der)
+    out[sig_cs + sig_len - 1] ^= 0x01
+    return bytes(out)
+
+
+def _ocsp_basic_parts(der: bytes):
+    """Return (status_part, oid_part, basic) slices of a DER OCSP response."""
+    _, _, p = _der_read(der, 0)
+    _, status_len, _ = _der_read(der, p)
+    status_part = der[p : p + 2 + status_len]
+    assert status_part[0] == 0x0A, "expected ENUMERATED responseStatus"
+    _, _, p2 = _der_read(der, p + 2 + status_len)   # [0] EXPLICIT
+    assert der[p + 2 + status_len] == 0xA0
+    _, _, p3 = _der_read(der, p2)                   # ResponseBytes SEQUENCE
+    _, oid_len, p4 = _der_read(der, p3)             # responseType OID
+    oid_part = der[p3 : p4 + oid_len]
+    _, oct_len, p5 = _der_read(der, p4 + oid_len)   # response OCTET STRING
+    return status_part, oid_part, der[p5 : p5 + oct_len], p5
+
+
+def _wrap_ocsp_basic(status_part: bytes, oid_part: bytes, basic: bytes) -> bytes:
+    response_bytes = _der_encode(0x30, oid_part + _der_encode(0x04, basic))
+    return _der_encode(0x30, status_part + _der_encode(0xA0, response_bytes))
+
+
+def rewrite_ocsp_sig_algorithm(der: bytes, new_alg: bytes) -> bytes:
+    """Replace the signatureAlgorithm inside a BasicOCSPResponse, keeping
+    tbsResponseData and the signature BIT STRING unchanged.  Tests only."""
+    status_part, oid_part, basic, _ = _ocsp_basic_parts(der)
+    _, _, bp = _der_read(basic, 0)
+    _, tbs_len, bp2 = _der_read(basic, bp)
+    tbs = basic[bp : bp2 + tbs_len]
+    _, sa_len, sp = _der_read(basic, bp2 + tbs_len)
+    after = basic[sp + sa_len:]                     # signature BIT STRING + certs
+    new_basic = _der_encode(0x30, tbs + new_alg + after)
+    return _wrap_ocsp_basic(status_part, oid_part, new_basic)
+
+
+def corrupt_ocsp_signature(der: bytes) -> bytes:
+    """Flip the last byte of the OCSP signature value, leaving the declared
+    AlgorithmIdentifier and all DER lengths untouched.  Tests only."""
+    status_part, oid_part, basic, _ = _ocsp_basic_parts(der)
+    _, _, bp = _der_read(basic, 0)
+    _, tbs_len, bp2 = _der_read(basic, bp)
+    _, sa_len, sp = _der_read(basic, bp2 + tbs_len)
+    _, sig_len, sig_c = _der_read(basic, sp + sa_len)
+    basic2 = bytearray(basic)
+    basic2[sig_c + sig_len - 1] ^= 0x01
+    return _wrap_ocsp_basic(status_part, oid_part, bytes(basic2))
+
 
 def _pss_ocsp_surgery(der: bytes, key) -> bytes:
     """Replace the signatureAlgorithm/signature of a BasicOCSPResponse with

@@ -31,6 +31,17 @@ services:
       retries: 30
       start_period: 5s
 
+  # code-level regression run inside a container of the same image, gated on
+  # api-a being healthy (the same in-container acceptance link as
+  # `docker compose exec -T api-a python -m acceptance.regression_pss`).
+  # exits 0 only when every PSS-parameter assertion holds.
+  pss-regression:
+    build: .
+    depends_on:
+      api-a:
+        condition: service_healthy
+    command: ["python", "-m", "acceptance.regression_pss"]
+
   verify:
     build: .
     depends_on:
@@ -38,6 +49,8 @@ services:
         condition: service_healthy
       api-b:
         condition: service_healthy
+      pss-regression:
+        condition: service_completed_successfully
     environment:
       API_A_URL: http://api-a:8080
       API_B_URL: http://api-b:8080

@@ -246,10 +246,59 @@ _HASH_OIDS = {
     "1.3.14.3.2.26": "sha1",
 }
 
+# id-mgf1 (RFC 4055)
+OID_MGF1 = "1.2.840.113549.1.1.8"
+
+
+def read_algorithm_identifier(buf: bytes, pos: int = 0):
+    """Read one AlgorithmIdentifier SEQUENCE TLV from *buf* at *pos*.
+
+    ``AlgorithmIdentifier ::= SEQUENCE { OID, params ANY OPTIONAL }``.
+    Returns ``(oid_dotted, params_element_or_None, next_pos)`` where
+    *params_element* is the raw encoded parameters TLV (tag included) or
+    None when the optional parameters element is absent.
+    """
+    tag, start, end = read_tlv(buf, pos)
+    if tag != 0x30:
+        raise ValueError("AlgorithmIdentifier must be a SEQUENCE")
+    oid, consumed = der_to_oid(buf[start:])
+    p = start + consumed
+    params = buf[p:end] if p < end else None
+    return oid, params, end
+
+
+def _require_null_or_absent(params_element: bytes | None):
+    if params_element is None:
+        return
+    tag, start, end = read_tlv(params_element, 0)
+    if tag != 0x05 or start != end or end != len(params_element):
+        raise ValueError("AlgorithmIdentifier parameters must be NULL or absent")
+
+
+def extract_tbs_signature_algorithm(der: bytes):
+    """Extract the outer signatureAlgorithm from a DER Certificate or
+    CertificateList.
+
+    Both are ``SEQUENCE { tbs<X> SEQUENCE, signatureAlgorithm AlgorithmIdentifier,
+    signature BIT STRING }``; the signatureAlgorithm is the second element.
+    Returns ``(oid_dotted, params_element_or_None)``.
+    """
+    tag, outer_start, _ = read_tlv(der, 0)
+    if tag != 0x30:
+        raise ValueError("expected an outer SEQUENCE")
+    ttag, _, tbs_end = read_tlv(der, outer_start)  # tbsCertificate/tbsCertList
+    if ttag != 0x30:
+        raise ValueError("expected a tbs SEQUENCE as the first element")
+    oid, params, _ = read_algorithm_identifier(der, tbs_end)
+    return oid, params
+
 
 def extract_ocsp_signature_algorithm(der: bytes):
     """Pull the signatureAlgorithm OID and raw params out of a DER OCSP
-    response (cryptography does not expose PSS params for OCSP)."""
+    response (cryptography does not expose PSS params for OCSP).
+
+    Returns ``(oid_dotted, params_element_or_None)``.
+    """
     _, c, _ = read_tlv(der, 0)
     _, _, e = read_tlv(der, c)              # responseStatus
     tag, s, _ = read_tlv(der, e)            # [0] EXPLICIT ResponseBytes
@@ -264,27 +313,101 @@ def extract_ocsp_signature_algorithm(der: bytes):
     tag, as_, ae = read_tlv(basic, e4)      # signatureAlgorithm
     if tag != 0x30:
         raise ValueError("missing signatureAlgorithm")
-    alg_tlv = basic[e4:ae]
-    _, cs, _ = read_tlv(alg_tlv, 0)
-    oid, pos = der_to_oid(alg_tlv[cs:])
-    params = alg_tlv[cs + pos :] if cs + pos < len(alg_tlv) else None
+    oid, params, _ = read_algorithm_identifier(basic, e4)
     return oid, params
 
 
-def pss_params_hash_name(params_tlv: bytes | None):
-    """Extract the hash algorithm name from RSASSA-PSS params (None for the
-    PSS defaults, which are SHA-1 and therefore out of profile)."""
-    if not params_tlv:
+def parse_pss_params(params_element: bytes | None) -> dict | None:
+    """Strictly parse the RSASSA-PSS params element (RFC 4055)::
+
+        RSASSA-PSS-params ::= SEQUENCE {
+            hashAlgorithm      [0] AlgorithmIdentifier DEFAULT sha1,
+            maskGenAlgorithm   [1] AlgorithmIdentifier DEFAULT mgf1SHA1,
+            saltLength         [2] INTEGER DEFAULT 20,
+            trailerField       [3] TrailerField DEFAULT trailerFieldBC(1) }
+
+    *params_element* is the raw parameters TLV of the signature
+    AlgorithmIdentifier (the explicit outer SEQUENCE).  Returns
+    ``{"hash", "mgf", "mgf_hash", "salt_length", "trailer_field"}`` or None
+    when the element is absent or is not DER-valid PSS parameters.  Every
+    value is taken from the encoded declaration - nothing is ignored or
+    defaulted away: absent fields keep the RFC defaults (SHA-1 / MGF1-SHA1),
+    which are outside the supported profile.  The profile layer enforces
+    ``mgf == id-mgf1``, ``mgf_hash == hash`` and ``trailer_field == 1``.
+    """
+    if not params_element:
         return None
-    tag, start, end = read_tlv(params_tlv, 0)
-    if tag != 0x30:
+    try:
+        tag, start, end = read_tlv(params_element, 0)
+        if tag != 0x30:
+            return None
+        # the RSASSA-PSS-params SEQUENCE must be the whole parameters element:
+        # reject any trailing bytes inside the signature AlgorithmIdentifier
+        if end != len(params_element):
+            return None
+        spec: dict = {
+            "hash": "sha1",
+            "mgf": OID_MGF1,
+            "mgf_hash": "sha1",
+            "salt_length": 20,
+            "trailer_field": 1,
+        }
+        seen: set = set()
+        pos = start
+        while pos < end:
+            ftag, fstart, fend = read_tlv(params_element, pos)
+            if ftag == 0xA0:  # hashAlgorithm [0] EXPLICIT AlgorithmIdentifier
+                if 0 in seen:
+                    return None
+                seen.add(0)
+                h_oid, h_params, h_next = read_algorithm_identifier(params_element, fstart)
+                if h_next != fend:
+                    return None
+                _require_null_or_absent(h_params)
+                spec["hash"] = _HASH_OIDS.get(h_oid, h_oid)
+            elif ftag == 0xA1:  # maskGenAlgorithm [1] EXPLICIT
+                if 1 in seen:
+                    return None
+                seen.add(1)
+                m_oid, m_params, m_next = read_algorithm_identifier(params_element, fstart)
+                if m_next != fend:
+                    return None
+                spec["mgf"] = m_oid
+                if m_oid != OID_MGF1 or m_params is None:
+                    # out of profile: only MGF-1 with explicit inner hash is
+                    # supported; the declared OID is still recorded.
+                    spec["mgf_hash"] = None
+                else:
+                    itag, istart, iend = read_tlv(m_params, 0)
+                    if itag != 0x30 or iend != len(m_params):
+                        return None
+                    inner_oid, inner_params, _ = read_algorithm_identifier(m_params, 0)
+                    _require_null_or_absent(inner_params)
+                    spec["mgf_hash"] = _HASH_OIDS.get(inner_oid, inner_oid)
+            elif ftag == 0xA2:  # saltLength [2] INTEGER
+                if 2 in seen:
+                    return None
+                seen.add(2)
+                itag, istart, iend = read_tlv(params_element, fstart)
+                if itag != 0x02 or istart >= iend or iend != fend:
+                    return None
+                raw = params_element[istart:iend]
+                if raw[0] & 0x80:
+                    return None  # negative saltLength
+                if len(raw) > 1 and raw[0] == 0x00 and raw[1] < 0x80:
+                    return None  # non-minimal positive INTEGER encoding
+                spec["salt_length"] = int.from_bytes(raw, "big")
+            elif ftag == 0xA3:  # trailerField [3] INTEGER
+                if 3 in seen:
+                    return None
+                seen.add(3)
+                itag, istart, iend = read_tlv(params_element, fstart)
+                if itag != 0x02 or iend - istart != 1 or iend != fend:
+                    return None
+                spec["trailer_field"] = params_element[istart]
+            else:
+                return None
+            pos = fend
+        return spec
+    except ValueError:
         return None
-    pos = start
-    while pos < end:
-        tag, cs, ce = read_tlv(params_tlv, pos)
-        if tag == 0xA0:  # hashAlgorithm [0]
-            _, is_, _ = read_tlv(params_tlv, cs)
-            oid, _ = der_to_oid(params_tlv[is_:ce])
-            return _HASH_OIDS.get(oid)
-        pos = ce
-    return None  # default hashAlgorithm is sha1

@@ -232,8 +232,32 @@ def adjudication_input(leaf, anchors, artifact=b"acceptance artifact"):
     }
 
 
+def run_code_level_pss_regression():
+    """Code-level (non-HTTP) RSASSA-PSS parameter regression.
+
+    Runs the same business-module checks that are available inside any
+    container of the service image via
+    ``docker compose exec -T api-a python -m acceptance.regression_pss``.
+    Executed here as part of the one-shot ``verify`` service so the standard
+    ``docker compose up --build --exit-code-from verify`` flow enforces it.
+    """
+    from acceptance import regression_pss
+
+    direct_details = None
+    for name, ok, details in regression_pss.run_all():
+        check(f"code-level PSS: {name}", ok, "" if ok else str(details))
+        if name == "direct business-module repro":
+            direct_details = details
+    check("code-level PSS: MGF mismatch no longer accepted",
+          direct_details is not None
+          and direct_details["BUG_MGF_MISMATCH_ACCEPTED"] is False
+          and direct_details["mgf_mismatch_reason"] == "UNSUPPORTED",
+          str(direct_details))
+
+
 def main():
     print(f"acceptance: API_A={API_A} API_B={API_B}", flush=True)
+    run_code_level_pss_regression()
     check("api-a healthy", wait_healthy(API_A))
     check("api-b healthy", wait_healthy(API_B))
     if _failures:

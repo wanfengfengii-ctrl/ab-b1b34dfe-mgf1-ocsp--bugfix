@@ -183,6 +183,16 @@ class Explorer:
         # revocation of the child (its issuing key is the parent's key)
         outcome = self._rev.status(cert, parent)
         if outcome["status"] != "GOOD":
+            if outcome.get("unsupported_evidence"):
+                # the only usable revocation evidence was rejected for an
+                # out-of-profile encoding (e.g. RSASSA-PSS MGF-1 hash !=
+                # message hash): structured UNSUPPORTED, never a plain
+                # signature-invalid classification
+                return _fail(
+                    cert.fingerprint, R_REVOCATION, "UNSUPPORTED",
+                    f"revocation evidence contains out-of-profile encodings "
+                    f"(status {outcome['status']})",
+                )
             return _fail(cert.fingerprint, R_REVOCATION, outcome["status"],
                          f"revocation status {outcome['status']} at signed_at")
         return None

@@ -123,14 +123,16 @@ def parse_certificate(der: bytes, fingerprint: str | None = None) -> CertInfo:
     # --- signature algorithm ---------------------------------------------
     sig_oid = cert.signature_algorithm_oid.dotted_string
     try:
-        hash_alg = cert.signature_hash_algorithm
-    except Exception:
-        hash_alg = None
-    try:
-        sig_params = cert.signature_algorithm_parameters
+        from .derutil import extract_tbs_signature_algorithm
+
+        _raw_oid, sig_params = extract_tbs_signature_algorithm(der)
+        if _raw_oid != sig_oid:
+            # the two AlgorithmIdentifiers of a Certificate must be equal;
+            # trust the raw outer one (the signature actually carries it)
+            sig_oid = _raw_oid
     except Exception:
         sig_params = None
-    sig_alg = profile.signature_algorithm_descriptor(sig_oid, sig_params, hash_alg)
+    sig_alg = profile.signature_algorithm_descriptor(sig_oid, sig_params)
     if sig_alg is None:
         unsupported.append(
             _unsupported("UNSUPPORTED_SIGNATURE_ALGORITHM", f"signature algorithm OID {sig_oid}")

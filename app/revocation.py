@@ -141,14 +141,14 @@ def parse_crl(der: bytes, fingerprint: str | None = None) -> CrlInfo:
 
     sig_oid = crl.signature_algorithm_oid.dotted_string
     try:
-        hash_alg = crl.signature_hash_algorithm
-    except Exception:
-        hash_alg = None
-    try:
-        sig_params = crl.signature_algorithm_parameters
+        from .derutil import extract_tbs_signature_algorithm
+
+        _raw_oid, sig_params = extract_tbs_signature_algorithm(der)
+        if _raw_oid != sig_oid:
+            sig_oid = _raw_oid
     except Exception:
         sig_params = None
-    sig_alg = profile.signature_algorithm_descriptor(sig_oid, sig_params, hash_alg)
+    sig_alg = profile.signature_algorithm_descriptor(sig_oid, sig_params)
     if sig_alg is None:
         unsupported.append(
             _unsupported("UNSUPPORTED_SIGNATURE_ALGORITHM", f"signature algorithm OID {sig_oid}")
@@ -287,26 +287,19 @@ def parse_ocsp(der: bytes, fingerprint: str | None = None) -> OcspInfo:
     unsupported: list = []
 
     sig_oid = resp.signature_algorithm_oid.dotted_string
-    if sig_oid == profile.OID_RSASSA_PSS:
-        # cryptography does not expose PSS parameters for OCSP responses
-        from .derutil import extract_ocsp_signature_algorithm, pss_params_hash_name
+    # cryptography does not expose PSS parameters for OCSP responses; pull
+    # the exact AlgorithmIdentifier + params from the raw DER so the declared
+    # message hash, MGF-1 inner hash, salt length and trailerField are all
+    # validated against the profile.
+    try:
+        from .derutil import extract_ocsp_signature_algorithm
 
-        try:
-            _oid, params = extract_ocsp_signature_algorithm(der)
-            hash_name = pss_params_hash_name(params)
-        except ValueError:
-            hash_name = None
-        sig_alg = (
-            {"algorithm": f"rsa-pss-{hash_name}", "hash": hash_name}
-            if hash_name in ("sha256", "sha384", "sha512")
-            else None
-        )
-    else:
-        try:
-            hash_alg = resp.signature_hash_algorithm
-        except Exception:
-            hash_alg = None
-        sig_alg = profile.signature_algorithm_descriptor(sig_oid, None, hash_alg)
+        _raw_oid, sig_params = extract_ocsp_signature_algorithm(der)
+        if _raw_oid != sig_oid:
+            sig_oid = _raw_oid
+    except ValueError:
+        sig_params = None
+    sig_alg = profile.signature_algorithm_descriptor(sig_oid, sig_params)
     if sig_alg is None:
         unsupported.append(
             _unsupported("UNSUPPORTED_SIGNATURE_ALGORITHM", f"signature algorithm OID {sig_oid}")
@@ -431,16 +424,27 @@ def _responder_id_matches(ocsp: OcspInfo, cert: CertInfo) -> bool:
 def _verify_ocsp_authorization(ocsp: OcspInfo, issuer: CertInfo) -> tuple:
     """Validate the OCSP responder authorization chain.
 
-    Returns (ok, responder_description, verifying_cert_or_None).
+    Returns ``(ok, responder_description, verifying_cert_or_None, failure)``.
+    On success *responder_description* is ``"issuer"`` or
+    ``"delegated:<fingerprint>"`` and *failure* is None.  On failure
+    *responder_description* is None and *failure* is
+    ``{"reason": <structured reason>, "detail": <str>}`` with reason
+    ``"UNSUPPORTED"`` when the declared response signature encoding itself is
+    out of profile (e.g. an MGF-1 hash that does not match the message hash)
+    and ``"RESPONDER_UNAUTHORIZED"`` for ordinary signature/authorization
+    failures - the two are never conflated.
     """
     from .pki import parse_certificate
 
     if ocsp.sig_alg is None:
-        return False, "unsupported response signature algorithm", None
+        return False, None, None, {
+            "reason": "UNSUPPORTED",
+            "detail": "unsupported response signature algorithm",
+        }
     # (a) response signed directly by the issuer
     if issuer.key_alg is not None and _responder_id_matches(ocsp, issuer):
         if profile.verify_signature(issuer.public_key(), ocsp.sig_alg, ocsp.signature, ocsp.tbs):
-            return True, "issuer", issuer
+            return True, "issuer", issuer, None
     # (b) delegated responder: certificate embedded in the response
     for der in ocsp.responder_certs:
         try:
@@ -462,8 +466,11 @@ def _verify_ocsp_authorization(ocsp: OcspInfo, issuer: CertInfo) -> tuple:
         ):
             continue
         if profile.verify_signature(rcert.public_key(), ocsp.sig_alg, ocsp.signature, ocsp.tbs):
-            return True, f"delegated:{rcert.fingerprint}", rcert
-    return False, "no authorized responder", None
+            return True, f"delegated:{rcert.fingerprint}", rcert, None
+    return False, None, None, {
+        "reason": "RESPONDER_UNAUTHORIZED",
+        "detail": "no authorized responder",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -645,9 +652,10 @@ class RevocationEvaluator:
             if single is None:
                 exclude(fp, "ocsp", "SERIAL_MISMATCH", "no single response for this certificate")
                 continue
-            ok, responder_desc, _rcert = _verify_ocsp_authorization(ocsp, issuer)
+            ok, responder_desc, _rcert, auth_failure = _verify_ocsp_authorization(ocsp, issuer)
             if not ok:
-                exclude(fp, "ocsp", "RESPONDER_UNAUTHORIZED", responder_desc, is_defective=True)
+                exclude(fp, "ocsp", auth_failure["reason"], auth_failure["detail"],
+                        is_defective=True)
                 continue
             if single.status == "revoked" and single.revocation_time is None:
                 exclude(fp, "ocsp", "INVALID_REVOKED_ENTRY",
@@ -673,10 +681,21 @@ class RevocationEvaluator:
             "knowledge_cutoff": canon_time(cutoff),
         }
         if not views:
+            unsupported_defect = any(
+                isinstance(rec, dict) and rec.get("reason") == "UNSUPPORTED"
+                for rec in evaluated.values()
+            )
             outcome["status"] = "MALFORMED_EVIDENCE" if defective else "UNKNOWN"
             outcome["selected_view"] = None
             outcome["selected_evidence"] = []
             outcome["evaluated_evidence"] = [evaluated[k] for k in sorted(evaluated)]
+            # the conclusion only exists because the usable evidence was
+            # rejected for an out-of-profile encoding: keep the documented
+            # MALFORMED_EVIDENCE status but mark it so path validation can
+            # classify the branch as structured UNSUPPORTED rather than a
+            # plain signature/authorization failure
+            if defective and unsupported_defect:
+                outcome["unsupported_evidence"] = True
             return outcome
 
         views.sort(key=lambda v: (_neg_time(v["as_of"]), v["view_id"]))

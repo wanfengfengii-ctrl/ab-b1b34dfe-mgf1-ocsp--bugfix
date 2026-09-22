@@ -70,27 +70,50 @@ _PSS_BY_HASH = {
 OID_RSASSA_PSS = SignatureAlgorithmOID.RSASSA_PSS.dotted_string
 OID_ECDSA_SHA256 = SignatureAlgorithmOID.ECDSA_WITH_SHA256.dotted_string
 OID_ED25519 = SignatureAlgorithmOID.ED25519.dotted_string
+OID_MGF1 = "1.2.840.113549.1.1.8"
 
 
-def signature_algorithm_descriptor(sig_oid: str, sig_params, hash_alg) -> dict | None:
-    """Map a signature algorithm OID (+parsed params) to a profile descriptor.
+def signature_algorithm_descriptor(sig_oid: str, params_element) -> dict | None:
+    """Map a signature algorithm OID (+raw DER params) to a profile descriptor.
+
+    *params_element* is the raw encoded parameters TLV of the signature
+    AlgorithmIdentifier exactly as it appears in the DER (tag included), or
+    None when absent.  For RSASSA-PSS every declared parameter is validated
+    against the profile: the message hash must be SHA-256/384/512, the mask
+    algorithm must be MGF-1, the MGF-1 inner hash must equal the message
+    hash and ``trailerField`` must be 1 (the only PKCS#1 v2.2 trailer
+    field).  The salt length is recorded but not restricted (it is recovered
+    at verification time).  Absent, malformed or out-of-profile parameter
+    declarations yield None - the declared encoding is never ignored in
+    favour of implicit defaults (the PSS defaults are SHA-1).
 
     Returns None when the algorithm is out of profile.
     """
     if sig_oid == OID_RSASSA_PSS:
-        if hash_alg is None:
+        from .derutil import parse_pss_params
+
+        spec = parse_pss_params(params_element)
+        if spec is None:
             return None
-        name = hash_alg.name
+        name = spec["hash"]
         if name not in _PSS_BY_HASH:
             return None
-        desc = {"algorithm": _PSS_BY_HASH[name], "hash": name}
-        if sig_params is not None and isinstance(sig_params, padding.PSS):
-            mgf_hash = getattr(sig_params._mgf, "_algorithm", None)
-            desc["mgf_hash"] = getattr(mgf_hash, "name", None)
-            desc["salt_length"] = sig_params._salt_length
-            if desc["mgf_hash"] != name:
-                return None  # profile requires MGF-1 hash == signature hash
-        return desc
+        if spec["mgf"] != OID_MGF1:
+            return None
+        if spec["mgf_hash"] != name:
+            # profile requires MGF-1 hash == message hash; a mismatch is a
+            # structured out-of-profile encoding, never a plain verify failure
+            return None
+        if spec["trailer_field"] != 1:
+            return None
+        return {
+            "algorithm": _PSS_BY_HASH[name],
+            "hash": name,
+            "mgf": OID_MGF1,
+            "mgf_hash": name,
+            "salt_length": spec["salt_length"],
+            "trailer_field": 1,
+        }
     if sig_oid == OID_ECDSA_SHA256:
         return {"algorithm": ALG_ECDSA_P256_SHA256, "hash": "sha256"}
     if sig_oid == OID_ED25519:
